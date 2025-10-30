@@ -6,7 +6,7 @@
 
 ### **HQ:** Bangalore, India
 
-### **Website:** [www.doozhub.com](http://www.doozhub.com) (suggested)
+### **Website:** [www.doozhub.com](http://www.doozhub.com) (tentative)
 
 ### **Parent Company:** DoozieSoft
 
