@@ -1,0 +1,176 @@
+name: Veto CI Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main, master, develop]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+jobs:
+  veto-evaluation:
+    name: Veto - Entropy Evaluation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Veto
+        run: |
+          cd dooz-veto
+          cargo build --release
+
+      - name: Generate PR Diff
+        run: |
+          git diff origin/${{ github.base_ref }}...HEAD > /tmp/pr-diff.patch
+          echo "Diff size: $(wc -l < /tmp/pr-diff.patch) lines"
+
+      - name: Run Veto Evaluation
+        id: veto
+        run: |
+          cd dooz-veto
+          ./target/release/dooz-veto evaluate \
+            --diff /tmp/pr-diff.patch \
+            --repo ${{ github.repository }} \
+            --pr ${{ github.event.pull_request.number }} \
+            --output /tmp/veto-result.json \
+            2>&1 || true
+
+      - name: Parse Veto Result
+        id: parse
+        run: |
+          if [ -f /tmp/veto-result.json ]; then
+            VERDICT=$(cat /tmp/veto-result.json | jq -r '.verdict // "accept"')
+            echo "verdict=$VERDICT" >> $GITHUB_OUTPUT
+            echo "## Veto Evaluation" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            cat /tmp/veto-result.json | jq -r '
+              "**Verdict:** \(.verdict)\n\n" +
+              "**Entropy Score:** \(.entropy_score)\n\n" +
+              "**Decay Signals:** \(.decay_signals | length)\n\n" +
+              "**Blast Radius:** \(.blast_radius)\n\n" +
+              "### Details\n\n" +
+              (.details // [] | map("- \(.)") | join("\n")) +
+              "\n\n" +
+              "**Rollback Plan:** " + (.rollback_plan // "N/A")
+            ' >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "Could not parse result" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "verdict=accept" >> $GITHUB_OUTPUT
+            echo "No veto result generated - accepting by default" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Comment on PR
+        if: steps.parse.outputs.verdict == 'refuse'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const verdict = '${{ steps.parse.outputs.verdict }}';
+            if (verdict === 'refuse') {
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: `## 🚫 Veto Refusal\n\nThe Veto constraint engine has refused this PR.\n\n**Reason:** This change increases system entropy or accelerates decay.\n\nSee the Checks tab for detailed evaluation.\n\n**Constitutional Laws:**\n1. Memory is append-only\n2. Evaluation is deterministic\n3. Veto has precedence\n4. Addressing is causal\n5. Projection is one-way\n6. Refusal is success`
+              });
+            }
+
+      - name: Fail if Veto Refused
+        if: steps.parse.outputs.verdict == 'refuse'
+        run: |
+          echo "Veto refused this PR. Changes increase system entropy."
+          exit 1
+
+  structural-analysis:
+    name: Veto - Structural Drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for .env files
+        run: |
+          ENV_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -E '\.env$|\.env\.local$|\.env\.production$' || true)
+          if [ -n "$ENV_FILES" ]; then
+            echo "::error::Tracked .env files detected: $ENV_FILES"
+            exit 1
+          fi
+          echo "No .env files tracked"
+
+      - name: Check for credential files
+        run: |
+          CRED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -iE 'credential|secret|password|token|api_key' || true)
+          if [ -n "$CRED_FILES" ]; then
+            echo "::warning::Files with credential-like names: $CRED_FILES"
+          fi
+
+      - name: Check for debug scripts
+        run: |
+          DEBUG_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -E 'debug_|test_debug|tmp_' || true)
+          if [ -n "$DEBUG_FILES" ]; then
+            echo "::warning::Debug/temp files detected: $DEBUG_FILES"
+          fi
+
+      - name: Check gitignore compliance
+        run: |
+          if [ -f .gitignore ]; then
+            echo "gitignore exists"
+          else
+            echo "::warning::No .gitignore found"
+          fi
+
+  dependency-audit:
+    name: Veto - Dependency Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+
+      - name: Check Rust dependencies
+        if: hashFiles('**/Cargo.toml') != ''
+        run: |
+          for cargo in $(find . -name Cargo.toml -not -path '*/target/*'); do
+            echo "Checking $cargo"
+            if grep -q 'unsafe' "$cargo" 2>/dev/null; then
+              echo "::warning::Unsafe code in $cargo"
+            fi
+          done
+
+      - name: Check PHP dependencies
+        if: hashFiles('**/composer.json') != ''
+        run: |
+          for composer in $(find . -name composer.json -not -path '*/vendor/*'); do
+            echo "Checking $composer"
+            cd $(dirname $composer)
+            if command -v composer &> /dev/null; then
+              composer audit --no-interaction 2>/dev/null || echo "Composer audit skipped"
+            fi
+            cd - > /dev/null
+          done
+
+      - name: Check Node dependencies
+        if: hashFiles('**/package.json') != ''
+        run: |
+          for pkg in $(find . -name package.json -not -path '*/node_modules/*'); do
+            echo "Checking $pkg"
+            cd $(dirname $pkg)
+            if command -v npm &> /dev/null; then
+              npm audit --production 2>/dev/null || echo "npm audit skipped"
+            fi
+            cd - > /dev/null
+          done

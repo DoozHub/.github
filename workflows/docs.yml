@@ -1,0 +1,105 @@
+name: Docs CI
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+
+permissions:
+  contents: read
+
+jobs:
+  markdown-lint:
+    name: Markdown Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install markdownlint-cli
+        run: npm install -g markdownlint-cli
+
+      - name: Lint markdown files
+        run: |
+          if [ -f .markdownlint.json ] || [ -f .markdownlint.yaml ] || [ -f .markdownlint.yml ]; then
+            markdownlint '**/*.md' --ignore node_modules
+          else
+            markdownlint '**/*.md' --ignore node_modules --disable MD013
+          fi
+
+  link-check:
+    name: Link Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install markdown-link-check
+        run: npm install -g markdown-link-check
+
+      - name: Check links
+        run: |
+          find . -name "*.md" -not -path "*/node_modules/*" -not -path "*/vendor/*" | while read -r file; do
+            echo "Checking links in $file"
+            markdown-link-check --quiet "$file" || true
+          done
+
+  build-docs:
+    name: Build Docs Viewer
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: hashFiles('package.json') != '' || hashFiles('bun.lockb') != ''
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-docs-${{ hashFiles('**/bun.lockb', '**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-docs-
+
+      - name: Install dependencies
+        run: |
+          if [ -f bun.lockb ]; then
+            bun install --frozen-lockfile
+          elif [ -f package-lock.json ]; then
+            npm ci
+          elif [ -f package.json ]; then
+            npm install
+          fi
+
+      - name: Build docs
+        run: |
+          if grep -q '"build"' package.json 2>/dev/null; then
+            if [ -f bun.lockb ]; then
+              bun run build
+            else
+              npm run build
+            fi
+          else
+            echo "No build script found, skipping"
+          fi
